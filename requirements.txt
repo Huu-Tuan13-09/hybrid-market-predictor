@@ -1,0 +1,55 @@
+# ============================================================
+# Hybrid AI Market Predictor — requirements.txt
+# Python 3.10+
+# Strategy: Pin top-level packages only.
+#           Let pip resolve transitive dependencies to avoid conflicts.
+# ============================================================
+
+# --- Web Framework & API ---
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pydantic==2.9.2
+pydantic-settings==2.6.1
+python-multipart==0.0.12
+httpx==0.27.2
+
+# --- Frontend ---
+streamlit==1.40.2
+plotly==5.24.1
+pandas==2.2.3
+
+# --- Market Data & Technical Analysis ---
+yfinance==0.2.50
+curl_cffi                  # Chrome TLS fingerprint spoofing — bypasses Yahoo Finance Docker IP blocks
+vnstock3                   # Preferred VN index source (actively maintained fork)
+vnstock                    # Legacy VN index source (fallback)
+ta==0.11.0
+
+# --- Machine Learning ---
+xgboost==2.1.3
+scikit-learn==1.5.2
+joblib==1.4.2
+numpy==1.26.4
+
+# --- Web Scraping ---
+beautifulsoup4==4.12.3
+lxml==5.3.0
+
+# --- LLM & Multi-Agent (LangGraph) ---
+# Note: langchain-core version is intentionally NOT pinned here.
+# langchain-groq==0.2.2 requires langchain-core>=0.3.27,
+# so we let pip resolve the compatible version automatically.
+langchain==0.3.9
+langchain-groq==0.2.2
+langgraph==0.2.56
+langchain-community==0.3.9
+
+# --- RAG & Vector DB ---
+chromadb==0.5.23
+sentence-transformers==3.3.1
+unstructured[pdf]==0.15.13
+
+# --- Utilities ---
+python-dotenv==1.0.1
+loguru==0.7.2
+tenacity==9.0.0

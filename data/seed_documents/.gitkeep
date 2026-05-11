@@ -1,0 +1,10 @@
+# Seed documents for ChromaDB (PDF, TXT, DOCX macro reports)
+# Place your macro economic reports, FED minutes, NHNN policy documents here.
+# Run: docker-compose run --rm backend python backend/rag_engine/indexer.py
+# to index all documents in this directory into ChromaDB.
+#
+# Suggested files to add:
+#   - FED_FOMC_minutes_2026.pdf
+#   - Vietnam_GDP_report_Q1_2026.pdf
+#   - NHNN_monetary_policy_2026.pdf
+#   - World_Bank_Vietnam_outlook.pdf

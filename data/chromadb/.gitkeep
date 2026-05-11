@@ -1,0 +1,3 @@
+# ChromaDB persistent storage
+# This directory is mounted as a Docker volume — contents persist across container restarts.
+# Do NOT commit actual ChromaDB files (add data/chromadb/* to .gitignore).

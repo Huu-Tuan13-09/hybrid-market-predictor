@@ -1,0 +1,3 @@
+# Trained XGBoost model storage (.pkl, .json files)
+# This directory is mounted as a Docker volume — contents persist across container restarts.
+# Do NOT commit model binaries (add data/models/*.pkl to .gitignore).

@@ -1,0 +1,62 @@
+services:
+  # Chạy 1 lần để nạp dữ liệu và huấn luyện mô hình
+  init:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: hybrid_init
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Ho_Chi_Minh
+    volumes:
+      - ./data:/app/data
+    command: >
+      sh -c "python -m backend.rag_engine.indexer && 
+             python -m backend.ml_models.trainer"
+
+  # Backend — FastAPI + LangGraph + XGBoost
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: hybrid_backend
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - PYTHONPATH=/app
+      - CHROMA_DB_PATH=/app/data/chromadb
+      - MODEL_PATH=/app/data/models
+      - TZ=Asia/Ho_Chi_Minh
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # Frontend — Streamlit UI
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: hybrid_frontend
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      - BACKEND_URL=http://backend:8000
+      - TZ=Asia/Ho_Chi_Minh
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped

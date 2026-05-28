@@ -30,18 +30,41 @@ from backend.config import get_settings
 
 _SYSTEM_PROMPT = """Bạn là Chuyên gia Phân tích Tâm lý Thị trường (Market Sentiment Analyst) chuyên về thị trường chứng khoán Việt Nam.
 
-Phương pháp phân tích:
-1. Đọc kỹ TIÊU ĐỀ và TÓM TẮT của từng bài báo
+⚠️ CẢNH BÁO KIỂM SOÁT NHẬN THỨC — NEGATIVE PROMPT TUNING:
+BẠN CÓ XU HƯỚNG BỊ ĐÁNH LỪA BỞI CÁC CON SỐ LỚN VÀ TỪ NGỮ CỰC ĐOAN.
+Trước khi cho điểm bất kỳ câu nào, BẮT BUỘC phân tích cấu trúc CHỦ NGỮ → ĐỘNG TỪ → TÂN NGỮ:
+
+  ✗ SAI — đọc con số trước rồi suy ra cảm xúc:
+    "Hàng tỷ USD bốc hơi" → bạn thấy "Tỷ USD" → nghĩ TÍCH CỰC → SAI NGHIÊM TRỌNG
+
+  ✓ ĐÚNG — đọc động từ trước:
+    "bốc hơi" / "rút ròng" / "tháo chạy" → TIÊU CỰC dù số tiền bao nhiêu
+    "bơm vào" / "giải ngân" / "mua ròng" → TÍCH CỰC dù số tiền bao nhiêu
+
+CÁC TỪ KHÓA SỐ LƯỢNG KHÔNG MANG CẢM XÚC — CHỈ ĐỘNG TỪ MỚI QUYẾT ĐỊNH:
+  - "Tỷ USD", "Nghìn tỷ", "Kỷ lục", "Lịch sử", "Đỉnh", "Đáy" → KHÔNG có cảm xúc riêng
+  - Phải xét ĐỘNG TỪ đi kèm để phân loại
+
+PHÂN BIỆT CHÂN TRỜI THỜI GIAN (BẮT BUỘC):
+  - Tin ngắn hạn (0-5 ngày): ảnh hưởng trực tiếp đến phiên hiện tại → time_horizon = "SHORT"
+  - Tin trung hạn (1-3 tháng): dự báo quý, chính sách đang triển khai → time_horizon = "MEDIUM"
+  - Tin dài hạn (>6 tháng): mục tiêu năm, chiến lược, định hướng → time_horizon = "LONG"
+  ⚠️ Tin dài hạn KHÔNG được phép ảnh hưởng mạnh đến lệnh giao dịch hôm nay!
+
+Phương pháp phân tích (thứ tự BẮT BUỘC):
+1. Với mỗi bài: xác định ĐỘNG TỪ chính → sau đó mới đọc số lượng
 2. Phân loại từng bài: POSITIVE / NEGATIVE / NEUTRAL
-3. Chú ý đặc biệt đến các từ khóa tác động mạnh:
-   - TIÊU CỰC: "bán ròng", "bán tháo", "thua lỗ", "lo ngại", "áp lực", "giảm sâu", "khủng hoảng"
-   - TÍCH CỰC: "mua ròng", "tăng vốn", "kỷ lục", "lạc quan", "phục hồi", "đột phá", "tăng trưởng"
-4. Xác định 2-3 CHỦ ĐỀ CHÍNH nổi bật nhất trong ngày
-5. Tính sentiment_score từ -1.0 (rất tiêu cực) đến +1.0 (rất tích cực)
+3. Gán time_horizon cho từng bài: SHORT / MEDIUM / LONG
+4. Chú ý đặc biệt đến các từ khóa tác động mạnh:
+   - TIÊU CỰC: "bán ròng", "rút ròng", "bán tháo", "bốc hơi", "tháo chạy", "thua lỗ", "lo ngại", "áp lực", "giảm sâu", "khủng hoảng"
+   - TÍCH CỰC: "mua ròng", "bơm vào", "giải ngân", "tăng vốn", "kỷ lục mới", "lạc quan", "phục hồi", "đột phá", "tăng trưởng"
+5. Xác định 2-3 CHỦ ĐỀ CHÍNH nổi bật nhất trong ngày
+6. Tính sentiment_score NGẮN HẠN từ -1.0 (rất tiêu cực) đến +1.0 (rất tích cực) — CHỈ dựa trên tin SHORT và MEDIUM
 
 Quy tắc:
 - Chỉ kết luận từ nội dung tin tức được cung cấp
 - Không suy diễn hay bổ sung thông tin ngoài
+- Tin dài hạn (LONG) KHÔNG được tính vào sentiment_score chính
 """
 
 
@@ -50,20 +73,24 @@ Quy tắc:
 # ---------------------------------------------------------------------------
 
 class ArticleSentiment(BaseModel):
-    title: str = Field(description="Tiêu đề bài báo")
-    sentiment: str = Field(description="Phân loại tâm lý: POSITIVE, NEGATIVE, hoặc NEUTRAL")
+    title:         str = Field(description="Tiêu đề bài báo")
+    sentiment:     str = Field(description="Phân loại tâm lý: POSITIVE, NEGATIVE, hoặc NEUTRAL")
+    time_horizon:  str = Field(description="Chân trời thời gian: SHORT (0-5 ngày), MEDIUM (1-3 tháng), hoặc LONG (>6 tháng)")
 
 class SentimentReport(BaseModel):
-    article_sentiments: list[ArticleSentiment] = Field(description="Danh sách đánh giá tâm lý cho từng bài báo")
-    positive_count: int = Field(description="Số lượng tin tức POSITIVE")
-    negative_count: int = Field(description="Số lượng tin tức NEGATIVE")
-    neutral_count: int = Field(description="Số lượng tin tức NEUTRAL")
-    overall_sentiment: str = Field(description="Tâm lý tổng thể: POSITIVE, NEGATIVE, NEUTRAL, hoặc MIXED")
-    dominant_themes: list[str] = Field(description="2-3 chủ đề chính nổi bật nhất trong ngày")
-    sentiment_score: float = Field(description="Điểm tâm lý từ -1.0 (rất tiêu cực) đến +1.0 (rất tích cực)")
-    market_fear_greed: str = Field(description="Trạng thái thị trường: FEAR, GREED, hoặc NEUTRAL")
-    confidence: int = Field(description="Độ tin cậy của đánh giá từ 0 đến 100")
-    summary: str = Field(description="Tóm tắt tổng thể tâm lý thị trường hôm nay trong 2-3 câu")
+    article_sentiments:       list[ArticleSentiment] = Field(description="Danh sách đánh giá tâm lý cho từng bài báo")
+    positive_count:           int   = Field(description="Số lượng tin tức POSITIVE")
+    negative_count:           int   = Field(description="Số lượng tin tức NEGATIVE")
+    neutral_count:            int   = Field(description="Số lượng tin tức NEUTRAL")
+    overall_sentiment:        str   = Field(description="Tâm lý tổng thể: POSITIVE, NEGATIVE, NEUTRAL, hoặc MIXED")
+    dominant_themes:          list[str] = Field(description="2-3 chủ đề chính nổi bật nhất trong ngày")
+    sentiment_score:          float = Field(description="Điểm tâm lý tổng hợp từ -1.0 đến +1.0")
+    short_term_score:         float = Field(description="Điểm tâm lý CHỈ từ tin SHORT+MEDIUM — dùng cho Temporal Discounting")
+    long_term_article_count:  int   = Field(description="Số bài báo bị phân loại LONG — cảnh báo cho CIO")
+    market_fear_greed:        str   = Field(description="Trạng thái thị trường: FEAR, GREED, hoặc NEUTRAL")
+    confidence:               int   = Field(description="Độ tin cậy của đánh giá từ 0 đến 100")
+    summary:                  str   = Field(description="Tóm tắt tổng thể tâm lý thị trường hôm nay trong 2-3 câu")
+
 
 
 # ---------------------------------------------------------------------------

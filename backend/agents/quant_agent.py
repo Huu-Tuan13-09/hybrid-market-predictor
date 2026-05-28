@@ -99,6 +99,69 @@ Hãy phân tích và trả về JSON theo đúng định dạng yêu cầu."""
 
 
 # ---------------------------------------------------------------------------
+# Quant Veto — Falling Knife / Circuit Breaker
+# ---------------------------------------------------------------------------
+
+_VETO_MIN_SIGNALS = 2  # Số tín hiệu tối thiểu để kích hoạt Veto (trên 3)
+
+
+def _check_falling_knife_veto(
+    indicators: dict, ohlcv: dict
+) -> tuple[bool, str]:
+    """
+    Phát hiện kịch bản 'Bắt dao rơi' (Catching a Falling Knife).
+
+    Kiểm tra 3 tín hiệu độc lập — kích hoạt Veto nếu >= 2 tín hiệu cùng bật:
+      1. Volume Breakdown  : volume_ratio < 0.55  (thanh khoản cạn kiệt)
+      2. Downtrend Accel   : ADX > 28 VÀ return_1d < -1.5%
+      3. Volatility Spike  : ATR/Close > 2.5%     (biến động bùng nổ)
+
+    Khi kích hoạt → ghi đè toàn bộ dự báo XGBoost → STRONG SELL vô điều kiện.
+
+    Returns:
+        (veto_triggered: bool, reason: str)
+    """
+    signals_fired: list[str] = []
+
+    # Tín hiệu 1 — Volume Breakdown (sốc thanh khoản)
+    try:
+        vol_ratio = float(indicators.get("volume_ratio") or 0)
+        if 0 < vol_ratio < 0.55:
+            signals_fired.append(
+                f"Volume Breakdown (ratio={vol_ratio:.2f}<0.55 — thanh khoản cạn kiệt)"
+            )
+    except (TypeError, ValueError):
+        pass
+
+    # Tín hiệu 2 — ADX Downtrend Acceleration (gia tốc xu hướng giảm)
+    try:
+        adx       = float(indicators.get("adx") or 0)
+        return_1d = float(ohlcv.get("return_1d") or 0)
+        if adx > 28 and return_1d < -1.5:
+            signals_fired.append(
+                f"Downtrend Accel (ADX={adx:.1f}>28, return_1d={return_1d:.2f}%<-1.5%)"
+            )
+    except (TypeError, ValueError):
+        pass
+
+    # Tín hiệu 3 — ATR Volatility Spike (độ giãn nở biến động)
+    try:
+        atr   = float(indicators.get("atr_14") or 0)
+        close = float(ohlcv.get("close") or 1)
+        atr_pct = atr / close if close > 0 else 0
+        if atr_pct > 0.025:
+            signals_fired.append(
+                f"Volatility Spike (ATR/Close={atr_pct:.3%}>2.5%)"
+            )
+    except (TypeError, ValueError):
+        pass
+
+    veto   = len(signals_fired) >= _VETO_MIN_SIGNALS
+    reason = " | ".join(signals_fired) if signals_fired else "No veto conditions met"
+    return veto, reason
+
+
+# ---------------------------------------------------------------------------
 # LLM Call with Retry
 # ---------------------------------------------------------------------------
 
@@ -121,15 +184,43 @@ def quant_agent_node(state: AgentState) -> dict[str, Any]:
     """
     LangGraph node for Quant Agent.
     Reads: ml_prediction, technical_indicators, ohlcv_summary
-    Writes: quant_report
+    Writes: quant_report  (bao gồm veto_signal: bool)
     """
     logger.info("[Quant Agent] Starting analysis…")
     settings = get_settings()
 
+    indicators = state.get("technical_indicators", {})
+    ohlcv      = state.get("ohlcv_summary", {})
+
+    # ── STEP 0: Falling Knife Veto — Circuit Breaker ────────────────────────
+    veto_triggered, veto_reason = _check_falling_knife_veto(indicators, ohlcv)
+    if veto_triggered:
+        logger.warning(
+            f"[Quant Agent] 🚨 FALLING KNIFE VETO TRIGGERED — "
+            f"XGBoost prediction OVERRIDDEN | reason: {veto_reason}"
+        )
+        report = {
+            "signals":          [f"🚨 CIRCUIT BREAKER: {veto_reason}"],
+            "ml_alignment":     "XGBoost bị GHI ĐÈ bởi Veto Circuit Breaker — không có giá trị tham khảo",
+            "trend_assessment": "BEARISH",
+            "key_levels":       {},
+            "recommendation":   "STRONG SELL",
+            "confidence":       95,
+            "summary": (
+                f"Phát hiện nguy cơ 'Bắt dao rơi'. "
+                f"Circuit Breaker kích hoạt: {veto_reason}. "
+                f"Toàn bộ tín hiệu XGBoost và TA bị vô hiệu hóa. KHÔNG MUA."
+            ),
+            "veto_signal":      True,
+            "veto_reason":      veto_reason,
+        }
+        return {"quant_report": report}
+
+    # ── STEP 1: Normal LLM Analysis Path ────────────────────────────────────
     llm = ChatGroq(
         model       = settings.groq_model,
         api_key     = settings.groq_api_key,
-        temperature = 0.1,   # Low temp for analytical consistency
+        temperature = 0.1,
         max_tokens  = 1024,
     )
 
@@ -140,9 +231,10 @@ def quant_agent_node(state: AgentState) -> dict[str, Any]:
 
     try:
         raw_response = _call_llm(llm, messages)
-        # Strip any accidental markdown code fences
         clean = raw_response.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
         report = json.loads(clean)
+        report["veto_signal"] = False
+        report["veto_reason"] = None
         logger.success(
             f"[Quant Agent] Done | recommendation={report.get('recommendation')} "
             f"| confidence={report.get('confidence')}%"
@@ -157,6 +249,8 @@ def quant_agent_node(state: AgentState) -> dict[str, Any]:
             "recommendation":   "NEUTRAL",
             "confidence":       0,
             "summary":          f"Quant Agent parse error: {exc}",
+            "veto_signal":      False,
+            "veto_reason":      None,
         }
     except Exception as exc:
         logger.error(f"[Quant Agent] LLM call failed: {exc}")
@@ -168,6 +262,8 @@ def quant_agent_node(state: AgentState) -> dict[str, Any]:
             "recommendation":   "NEUTRAL",
             "confidence":       0,
             "summary":          f"Quant Agent unavailable: {exc}",
+            "veto_signal":      False,
+            "veto_reason":      None,
         }
         errors = list(state.get("error_messages", []))
         errors.append(f"Quant Agent error: {exc}")

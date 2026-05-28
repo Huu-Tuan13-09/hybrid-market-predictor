@@ -68,6 +68,146 @@ _WEIGHTS: dict[WeightRegime, dict[str, float]] = {
 }
 
 # ---------------------------------------------------------------------------
+# Temporal Discounting — γ Factor
+# ---------------------------------------------------------------------------
+
+# Hệ số chiết khấu theo chân trời thời gian (Spatio-Temporal Discounting)
+# Tin dài hạn KHÔNG được phép ảnh hưởng mạnh đến lệnh giao dịch hôm nay
+_TEMPORAL_DISCOUNT: dict[str, float] = {
+    "SHORT":  1.0,   # Tác động ngay lập tức — giữ nguyên 100%
+    "MEDIUM": 0.5,   # Tác động trung hạn — chiết khấu 50%
+    "LONG":   0.1,   # Tầm nhìn dài hạn — chiết khấu 90%
+}
+
+
+def _apply_temporal_discount(state: AgentState) -> tuple[float, float, str]:
+    """
+    Tính điểm Sentiment và Macro sau khi áp dụng hệ số chiết khấu γ.
+
+    Logic Sentiment:
+      - Ưu tiên dùng `short_term_score` (LLM tự tính cho tin SHORT+MEDIUM)
+      - Fallback: ước tính γ từ tỷ lệ bài LONG trong article_sentiments
+
+    Logic Macro:
+      - Phân tách short_term_impact (γ=1.0) và long_term_impact (γ=0.1)
+      - Tỷ lệ: 70% ngắn hạn + 30% dài hạn × γ_long
+
+    Returns:
+        (discounted_sentiment: float, discounted_macro: float, log_msg: str)
+    """
+    sentiment_report = state.get("sentiment_report", {})
+    economist_report = state.get("economist_report", {})
+    long_count = 0
+
+    # ── Sentiment Discounting ─────────────────────────────────────────────
+    raw_s_score = float(sentiment_report.get("sentiment_score", 0) or 0)
+
+    if "short_term_score" in sentiment_report:
+        # LLM đã tính sẵn điểm ngắn hạn — dùng trực tiếp
+        disc_s_score = float(sentiment_report["short_term_score"] or 0)
+        long_count   = int(sentiment_report.get("long_term_article_count", 0))
+        s_method     = "short_term_score từ LLM"
+    else:
+        # Fallback: ước tính γ từ tỷ lệ bài LONG
+        articles   = sentiment_report.get("article_sentiments", [])
+        total      = len(articles)
+        long_count = sum(
+            1 for a in articles
+            if (a.get("time_horizon") or "").upper() == "LONG"
+        )
+        if total > 0:
+            long_ratio   = long_count / total
+            gamma_s      = 1.0 - long_ratio * (1.0 - _TEMPORAL_DISCOUNT["LONG"])
+            disc_s_score = raw_s_score * gamma_s
+        else:
+            disc_s_score = raw_s_score
+        s_method = f"γ ước tính (long={long_count}/{total})"
+
+    # ── Macro Discounting ─────────────────────────────────────────────────
+    _macro_map = {
+        "bullish": 1.0,  "positive": 1.0,
+        "bearish": -1.0, "negative": -1.0,
+        "cautious": -0.3, "neutral": 0.0,
+    }
+
+    def _to_m(val: str) -> float:
+        return _macro_map.get((val or "").lower().strip(), 0.0)
+
+    short_impact = economist_report.get("short_term_impact", "NEUTRAL")
+    long_impact  = economist_report.get("long_term_impact",  "NEUTRAL")
+    short_m      = _to_m(short_impact)
+    long_m       = _to_m(long_impact)
+
+    # 70% ngắn hạn (γ=1.0) + 30% dài hạn (γ=0.1)
+    disc_m_score = short_m * 0.70 + long_m * 0.30 * _TEMPORAL_DISCOUNT["LONG"]
+
+    log_msg = (
+        f"[Temporal Discount] "
+        f"S: raw={raw_s_score:+.3f} → disc={disc_s_score:+.3f} ({s_method}) | "
+        f"M: ST={short_impact}({short_m:+.2f}) LT={long_impact}({long_m:+.2f}) "
+        f"→ disc_macro={disc_m_score:+.3f} | long_articles={long_count}"
+    )
+    return round(disc_s_score, 4), round(disc_m_score, 4), log_msg
+
+
+# ---------------------------------------------------------------------------
+# CIO Veto — Systemic Failure Override
+# ---------------------------------------------------------------------------
+
+_SYSTEMIC_FAILURE_KEYWORDS: list[str] = [
+    # Tiếng Việt — Rủi ro hệ thống
+    "vỡ nợ", "chiến tranh", "đại dịch", "khủng hoảng hệ thống",
+    "sụp đổ ngân hàng", "bank run", "bắt bớt lãnh đạo", "phá sản hàng loạt",
+    "thảm họa tài chính", "vỡ bóng bóng", "tháo chạy vốn",
+    # English — Systemic failure signals
+    "default", "war outbreak", "pandemic", "systemic crisis",
+    "bank collapse", "mass bankruptcy", "financial meltdown",
+]
+
+
+def _check_cio_veto(state: AgentState) -> tuple[bool, str]:
+    """
+    Quét toàn bộ báo cáo Agent tìm kiếm tín hiệu thảm họa hệ thống.
+
+    Ưu tiên:
+      1. Quant Veto đã kích hoạt (cascade)
+      2. Từ khóa rủi ro hệ thống trong Sentiment / Economist
+
+    Khi kích hoạt → ngắt mạch (Short-circuit) toàn bộ weighted scoring
+                   → phát STRONG SELL vô điều kiện.
+
+    Returns:
+        (veto_triggered: bool, veto_reason: str)
+    """
+    # Ưu tiên 1: Cascade từ Quant Veto
+    quant_report = state.get("quant_report", {})
+    if quant_report.get("veto_signal"):
+        reason = quant_report.get("veto_reason", "Quant Veto đã kích hoạt")
+        logger.warning(f"[CIO Agent] Cascading from Quant Veto: {reason}")
+        return True, f"[CASCADE từ Quant Veto] {reason}"
+
+    # Ưu tiên 2: Quét từ khóa rủi ro hệ thống
+    sentiment_report = state.get("sentiment_report",  {})
+    economist_report = state.get("economist_report", {})
+
+    scan_text = " ".join([
+        str(sentiment_report.get("summary",                   "")),
+        str(sentiment_report.get("dominant_themes",           "")),
+        str(economist_report.get("summary",                   "")),
+        str(economist_report.get("macro_keywords_detected",   "")),
+        str(economist_report.get("macro_regime",              "")),
+    ]).lower()
+
+    triggered = [kw for kw in _SYSTEMIC_FAILURE_KEYWORDS if kw.lower() in scan_text]
+    if triggered:
+        reason = f"Systemic keywords: {triggered[:3]}"
+        logger.warning(f"[CIO Agent] Systemic failure keywords detected: {triggered}")
+        return True, reason
+
+    return False, ""
+
+
+# ---------------------------------------------------------------------------
 # System Prompt
 # ---------------------------------------------------------------------------
 
@@ -197,15 +337,17 @@ def _score_to_direction(score: float) -> tuple[str, float]:
 # ---------------------------------------------------------------------------
 
 def _build_human_message(
-    state: AgentState, regime: WeightRegime, weights: dict, score: float
+    state: AgentState, regime: WeightRegime, weights: dict, score: float,
+    disc_sentiment: float = 0.0, disc_macro: float = 0.0,
 ) -> str:
     q = state.get("quant_report",     {})
     s = state.get("sentiment_report", {})
     m = state.get("economist_report", {})
 
     direction_hint, conf_hint = _score_to_direction(score)
+    long_count = s.get("long_term_article_count", "N/A")
 
-    return f"""BÁO CÁO TỪ 3 CHUYÊN GIA — VN-INDEX FORECAST
+    return f"""BÁO CÁO TỪ 3 CHUÊN GIA — VN-INDEX FORECAST
 
 === CẤU HÌNH TRỌNG SỐ ===
 Chế độ: {regime}
@@ -220,20 +362,25 @@ Khuyến nghị:     {q.get('recommendation', 'N/A')}
 Confidence ML:   {q.get('confidence', 0)}%
 Xu hướng KT:    {q.get('trend_assessment', 'N/A')}
 Tín hiệu chính: {q.get('signals', [])}
+Veto Signal:     {'🚨 CIRCUIT BREAKER KÍCH HOẠT' if q.get('veto_signal') else '✅ Bình thường'}
 Tóm tắt:        {q.get('summary', 'N/A')}
 
 === BÁO CÁO SENTIMENT ANALYST (weight={weights['sentiment']*100:.0f}%) ===
-Tâm lý tổng thể: {s.get('overall_sentiment', 'N/A')}
-Sentiment score: {s.get('sentiment_score', 0)}
-Fear/Greed:      {s.get('market_fear_greed', 'N/A')}
-Chủ đề chính:   {s.get('dominant_themes', [])}
-Tóm tắt:        {s.get('summary', 'N/A')}
+Tâm lý tổng thể:    {s.get('overall_sentiment', 'N/A')}
+Sentiment score:   {s.get('sentiment_score', 0)} (raw)
+Disc. score (γ):   {disc_sentiment:+.4f} ← Đã chiết khấu tin dài hạn
+Bài báo dài hạn:  {long_count} bài bị loại bỏ khỏi scoring
+Fear/Greed:        {s.get('market_fear_greed', 'N/A')}
+Chủ đề chính:    {s.get('dominant_themes', [])}
+Tóm tắt:         {s.get('summary', 'N/A')}
 
 === BÁO CÁO MACRO ECONOMIST (weight={weights['macro']*100:.0f}%) ===
 Macro regime:    {m.get('macro_regime', 'N/A')}
-Tác động NH:    {m.get('short_term_impact', 'N/A')}
+Tác động NH:    {m.get('short_term_impact', 'N/A')} (trực tiếp, γ=1.0)
+Tác động DH:    {m.get('long_term_impact', 'N/A')} (chiết khấu, γ=0.1)
+Disc. macro (γ):  {disc_macro:+.4f} ← 70% ngắn hạn + 30%×0.1 dài hạn
 Macro sentiment: {m.get('macro_sentiment', 'N/A')}
-Keywords phát hiện: {m.get('macro_keywords_detected', [])}
+Keywords:        {m.get('macro_keywords_detected', [])}
 Tóm tắt:        {m.get('summary', 'N/A')}
 
 Với tư cách CIO, hãy tổng hợp và đưa ra quyết định đầu tư cuối cùng theo JSON format yêu cầu."""
@@ -262,10 +409,43 @@ def cio_agent_node(state: AgentState) -> dict[str, Any]:
     logger.info("[CIO Agent] Starting synthesis…")
     settings = get_settings()
 
-    # Step 1: Determine dynamic weights
+    # ── STEP 0: CIO Veto — Systemic Failure Override ──────────────────────
+    veto_triggered, veto_reason = _check_cio_veto(state)
+    if veto_triggered:
+        logger.warning(f"[CIO Agent] 🚨 CIO VETO TRIGGERED — Short-circuiting all scoring: {veto_reason}")
+        decision = {
+            "direction":        "GIẢM",
+            "confidence_score": 0.97,
+            "consensus":        "STRONG",
+            "weight_regime":    "VETO_OVERRIDE",
+            "weights_used":     {"quant": 0.0, "sentiment": 0.0, "macro": 1.0},
+            "weighted_score":   -1.0,
+            "key_signals":      [f"🚨 CIO VETO KÍCH HOẠT: {veto_reason}"],
+            "risk_factors": [
+                "Phát hiện sự kiện rủi ro hệ thống cực độ",
+                "Toàn bộ phương trình scoring bị ngắt mạch (Short-circuited)",
+            ],
+            "reasoning": (
+                f"CIO Veto kích hoạt do: {veto_reason}. "
+                f"Theo nguyên tắc sinh tồn, toàn bộ điểm số XGBoost, "
+                f"Sentiment và Macro bị ghi đè về mức âm tuyệt đối. "
+                f"Hệ thống phát lệnh STRONG SELL vô điều kiện."
+            ),
+            "action":           "BÁN",
+            "stop_loss_note":   "🚨 KHẨN CẤP: Thoát toàn bộ vị thế ngay lập tức. Rủi ro hệ thống cực cao.",
+            "veto_triggered":   True,
+            "veto_reason":      veto_reason,
+        }
+        return {"final_decision": decision}
+
+    # ── STEP 1: Determine dynamic weights ────────────────────────────────
     regime, weights = _determine_weight_regime(state)
 
-    # Step 2: Compute pre-LLM weighted score (for context injection)
+    # ── STEP 1.5: Temporal Discounting — γ Factor ─────────────────────────
+    disc_sentiment, disc_macro, td_log = _apply_temporal_discount(state)
+    logger.info(td_log)
+
+    # ── STEP 2: Compute pre-LLM weighted score (with discounted inputs) ───
     score = _compute_weighted_score(state, weights)
     direction_hint, conf_hint = _score_to_direction(score)
     logger.info(f"[CIO Agent] Pre-LLM score={score:+.4f} → hint={direction_hint} ({conf_hint:.0%})")
@@ -279,7 +459,11 @@ def cio_agent_node(state: AgentState) -> dict[str, Any]:
 
     messages = [
         SystemMessage(content=_SYSTEM_PROMPT),
-        HumanMessage(content=_build_human_message(state, regime, weights, score)),
+        HumanMessage(content=_build_human_message(
+            state, regime, weights, score,
+            disc_sentiment=disc_sentiment,
+            disc_macro=disc_macro,
+        )),
     ]
 
     try:
